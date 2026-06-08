@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cypher Linter</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.5;
+    }
+    h1 { font-size: 1.3rem; }
+    #status { font-size: 0.85rem; color: #888; }
+    textarea {
+      width: 100%;
+      min-height: 180px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 14px;
+      padding: 0.75rem;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      resize: vertical;
+    }
+    #results { margin-top: 1rem; }
+    .ok { color: #1a7f37; font-weight: 600; }
+    .diag {
+      display: flex;
+      gap: 0.6rem;
+      align-items: baseline;
+      padding: 0.5rem 0.6rem;
+      border-radius: 6px;
+      margin-bottom: 0.4rem;
+      border-left: 4px solid;
+    }
+    .diag .loc { font-family: ui-monospace, monospace; font-size: 0.8rem; opacity: 0.7; white-space: nowrap; }
+    .diag .msg { flex: 1; }
+    .sev-1 { border-color: #cf222e; background: #cf222e14; } /* Error */
+    .sev-2 { border-color: #bf8700; background: #bf870014; } /* Warning */
+    .sev-3 { border-color: #0969da; background: #0969da14; } /* Information */
+    .sev-4 { border-color: #6e7781; background: #6e778114; } /* Hint */
+    .badge { font-size: 0.7rem; text-transform: uppercase; font-weight: 700; letter-spacing: 0.03em; }
+  </style>
+</head>
+<body>
+  <h1>Cypher Linter</h1>
+  <p id="status">Loading linter…</p>
+
+  <textarea id="cypher" placeholder="Type Cypher here, e.g.&#10;MATCH (n:Person) WHERE n.age > 30 RETURN n">MATCH (n:Person WHERE n.age > 30 RETURN n</textarea>
+
+  <div id="results"></div>
+
+  <script type="module">
+    import workerpool from 'https://esm.sh/workerpool@9.2.0';
+
+    const statusEl = document.getElementById('status');
+    const inputEl = document.getElementById('cypher');
+    const resultsEl = document.getElementById('results');
+
+    // The lint-worker package exports nothing — when loaded it registers a
+    // `lintCypherQuery` method on its bundled workerpool. Its dist bundle is
+    // fully self-contained (no imports), so a classic worker can pull it
+    // straight off a CDN with importScripts. We wrap that in a blob worker
+    // (the bundle lives cross-origin) and drive it from the page via workerpool.
+    const LINT_WORKER_URL =
+      'https://cdn.jsdelivr.net/npm/@neo4j-cypher/lint-worker@2025.4.0/dist/esm/lintWorker.mjs';
+    const workerSource = `importScripts(${JSON.stringify(LINT_WORKER_URL)});`;
+    const workerUrl = URL.createObjectURL(
+      new Blob([workerSource], { type: 'application/javascript' })
+    );
+
+    const pool = workerpool.pool(workerUrl, {
+      workerType: 'web',
+      maxWorkers: 1,
+    });
+
+    const SEVERITY = { 1: 'Error', 2: 'Warning', 3: 'Info', 4: 'Hint' };
+
+    function render(diagnostics) {
+      resultsEl.innerHTML = '';
+      if (!diagnostics.length) {
+        resultsEl.innerHTML = '<p class="ok">✓ No problems found</p>';
+        return;
+      }
+      for (const d of diagnostics) {
+        const line = (d.range?.start?.line ?? 0) + 1;
+        const col = (d.range?.start?.character ?? 0) + 1;
+        const sev = d.severity ?? 1;
+        const el = document.createElement('div');
+        el.className = `diag sev-${sev}`;
+        el.innerHTML = `
+          <span class="loc">${line}:${col}</span>
+          <span class="msg"><span class="badge">${SEVERITY[sev] || 'Issue'}</span> — ${escapeHtml(d.message)}</span>
+        `;
+        resultsEl.appendChild(el);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    let seq = 0;
+    async function lint() {
+      const mySeq = ++seq;
+      const query = inputEl.value;
+      try {
+        // args: (query, dbSchema, featureFlags?)
+        const diagnostics = await pool.exec('lintCypherQuery', [
+          query,
+          {},                                  // empty DB schema
+          { consoleCommands: true },           // feature flags
+        ]);
+        if (mySeq !== seq) return;             // a newer request superseded this
+        render(diagnostics);
+      } catch (err) {
+        if (mySeq !== seq) return;
+        resultsEl.innerHTML = `<p class="ok" style="color:#cf222e">Linter error: ${escapeHtml(err.message || err)}</p>`;
+        console.error(err);
+      }
+    }
+
+    // Warm up the worker, then enable live linting.
+    statusEl.textContent = 'Starting linter worker…';
+    pool.exec('lintCypherQuery', ['RETURN 1', {}, {}])
+      .then(() => {
+        statusEl.textContent = 'Ready — linting as you type.';
+        lint();
+      })
+      .catch(err => {
+        statusEl.textContent = 'Failed to load linter (check console).';
+        console.error(err);
+      });
+
+    let debounce;
+    inputEl.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(lint, 250);
+    });
+  </script>
+</body>
+</html>
