@@ -52,6 +52,13 @@
 
   <textarea id="cypher" placeholder="Type Cypher here, e.g.&#10;MATCH (n:Person) WHERE n.age > 30 RETURN n">MATCH (n:Person WHERE n.age > 30 RETURN n</textarea>
 
+  <p style="font-size:0.85rem;margin-bottom:0.25rem;">
+    <label for="scopevars">Variables already in scope</label>
+    <span style="opacity:0.6;">(comma-separated — for fragments where these are bound upstream, e.g. <code>node, score</code>)</span>
+  </p>
+  <input id="scopevars" type="text" placeholder="node, score"
+         style="width:100%;box-sizing:border-box;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:6px;font-family:ui-monospace,monospace;" />
+
   <div id="results"></div>
 
   <script type="module">
@@ -105,10 +112,27 @@
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
+    const scopeEl = document.getElementById('scopevars');
+
+    // The linter has no API for "these variables are already bound", so we
+    // fabricate a leading `WITH null AS x, null AS y` clause that puts the
+    // named variables in scope, lint the wrapped query, then shift the
+    // reported line numbers back down by the lines we prepended.
+    function buildPreamble() {
+      const names = scopeEl.value
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s));
+      if (!names.length) return '';
+      return 'WITH ' + names.map(n => `null AS ${n}`).join(', ') + '\n';
+    }
+
     let seq = 0;
     async function lint() {
       const mySeq = ++seq;
-      const query = inputEl.value;
+      const preamble = buildPreamble();
+      const preambleLines = preamble ? preamble.split('\n').length - 1 : 0;
+      const query = preamble + inputEl.value;
       try {
         // args: (query, dbSchema, featureFlags?)
         const diagnostics = await pool.exec('lintCypherQuery', [
@@ -117,7 +141,18 @@
           { consoleCommands: true },           // feature flags
         ]);
         if (mySeq !== seq) return;             // a newer request superseded this
-        render(diagnostics);
+        // Drop anything inside the injected preamble, and undo the line shift.
+        const shifted = diagnostics
+          .filter(d => (d.range?.start?.line ?? 0) >= preambleLines)
+          .map(d => preambleLines === 0 ? d : {
+            ...d,
+            range: {
+              ...d.range,
+              start: { ...d.range.start, line: d.range.start.line - preambleLines },
+              end:   { ...d.range.end,   line: d.range.end.line   - preambleLines },
+            },
+          });
+        render(shifted);
       } catch (err) {
         if (mySeq !== seq) return;
         resultsEl.innerHTML = `<p class="ok" style="color:#cf222e">Linter error: ${escapeHtml(err.message || err)}</p>`;
@@ -138,10 +173,12 @@
       });
 
     let debounce;
-    inputEl.addEventListener('input', () => {
+    const scheduleLint = () => {
       clearTimeout(debounce);
       debounce = setTimeout(lint, 250);
-    });
+    };
+    inputEl.addEventListener('input', scheduleLint);
+    scopeEl.addEventListener('input', scheduleLint);
   </script>
 </body>
 </html>
